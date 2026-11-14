@@ -7,6 +7,7 @@ import io
 import contextlib
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 import pandas as pd
 import streamlit as st
@@ -20,10 +21,25 @@ from tools.universal_document_processor import extract_document
 from tools.financial_dashboard import extract_financial_metrics
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "documents" / "uploads"
-LOG_FILE = BASE_DIR / "logs" / "committee_runs.jsonl"
+
+# Use writable temporary storage on Streamlit Cloud.
+# Keep the original project folders on local Windows.
+if Path("/mount/src").exists():
+    APP_DATA_DIR = (
+        Path(tempfile.gettempdir())
+        / "debate_driven_investment_committee"
+    )
+else:
+    APP_DATA_DIR = BASE_DIR
+
+UPLOAD_DIR = APP_DATA_DIR / "documents" / "uploads"
+LOG_FILE = APP_DATA_DIR / "logs" / "committee_runs.jsonl"
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+print("[APP] Upload directory:", UPLOAD_DIR)
+print("[APP] Committee log:", LOG_FILE)
 
 SUPPORTED_EXTENSIONS = [
     "pdf", "docx", "xlsx", "xls", "csv", "pptx", "txt", "md",

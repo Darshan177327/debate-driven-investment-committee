@@ -1,8 +1,8 @@
-
 import re
 import hashlib
+import shutil
+import tempfile
 from pathlib import Path
-
 import chromadb
 from fastembed import TextEmbedding
 
@@ -15,9 +15,53 @@ from tools.universal_document_processor import extract_document
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-VECTOR_STORE_PATH = (
+# Original database containing your indexed company documents.
+SOURCE_VECTOR_STORE_PATH = (
     PROJECT_ROOT / "memory" / "vector_store"
 )
+
+# Use a writable temporary database on Streamlit Cloud.
+# Streamlit Cloud normally runs applications from /mount/src.
+if Path("/mount/src").exists():
+
+    VECTOR_STORE_PATH = (
+        Path(tempfile.gettempdir())
+        / "debate_driven_investment_committee"
+        / "vector_store"
+    )
+
+    if not VECTOR_STORE_PATH.exists():
+
+        VECTOR_STORE_PATH.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        if SOURCE_VECTOR_STORE_PATH.exists():
+
+            shutil.copytree(
+                SOURCE_VECTOR_STORE_PATH,
+                VECTOR_STORE_PATH
+            )
+
+        else:
+
+            VECTOR_STORE_PATH.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+else:
+
+    # Preserve the existing Windows database.
+    VECTOR_STORE_PATH = SOURCE_VECTOR_STORE_PATH
+
+VECTOR_STORE_PATH.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+print("[RAG] Database location:", VECTOR_STORE_PATH)
 
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSION = 384
