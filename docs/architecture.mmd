@@ -1,0 +1,68 @@
+flowchart TD
+    U["User / Analyst"] --> UI["Streamlit Frontend<br/>Company selection • Document upload • Committee room • Run history"]
+
+    UI --> CTRL["Committee Controller<br/>Coordinates agents • Shared company context • Final decision"]
+
+    subgraph MAF["Microsoft Agent Framework (MAF)"]
+        direction TB
+        RA["Research Agent"]
+        BA["Bull Agent"]
+        BEA["Bear Agent"]
+        subgraph REB["Rebuttal stage"]
+            direction LR
+            BR["Bull Rebuttal<br/>Responds to strongest Bear arguments"]
+            BER["Bear Rebuttal<br/>Responds to strongest Bull arguments"]
+        end
+        JA["Judge Agent<br/>Weighs cited evidence • BUY / HOLD / AVOID"]
+        RIA["Risk Agent<br/>Risk indicators • Weighted risk score"]
+    end
+
+    CTRL --> RA
+    RA --> BA
+    RA --> BEA
+    BA --> BR
+    BEA --> BER
+    BR --> JA
+    BER --> JA
+    JA --> CTRL
+    CTRL --> RIA
+    RIA --> CTRL
+
+    subgraph KNOW["Company-specific RAG / Knowledge layer"]
+        direction TB
+        UP["Universal Document Processor<br/>PDF • DOCX • XLSX/XLS • CSV • PPTX • TXT/MD • RTF • HTML • JSON • XML"]
+        EMB["FastEmbed<br/>BAAI/bge-small-en-v1.5<br/>Local 384-dimensional embeddings"]
+        DB[("ChromaDB<br/>Persistent, company-specific collections")]
+        RT["Research Tools<br/>Semantic search + keyword search"]
+        UP --> EMB --> DB
+        DB <--> RT
+    end
+
+    UI -->|"Uploaded company documents"| UP
+    RA -.-> RT
+    BA -.-> RT
+    BEA -.-> RT
+    BR -.-> RT
+    BER -.-> RT
+    JA -.-> RT
+
+    LLM["Gemini Chat Model<br/>gemini-3.5-flash-lite<br/>Agent reasoning"]:::external
+    RA -.-> LLM
+    BA -.-> LLM
+    BEA -.-> LLM
+    BR -.-> LLM
+    BER -.-> LLM
+    JA -.-> LLM
+    RIA -.-> LLM
+
+    CTRL --> VETO{"Risk veto?<br/>Score ≥ threshold"}
+    VETO -->|"Yes: override BUY"| HOLD["Final decision: HOLD"]
+    VETO -->|"No: retain Judge decision"| FINAL["Final decision:<br/>BUY / HOLD / AVOID"]
+    VETO -->|"Judge says AVOID"| AVOID["Final decision: AVOID"]
+
+    HOLD --> LOG[("Append-only run log<br/>logs/committee_runs.jsonl")]
+    FINAL --> LOG
+    AVOID --> LOG
+    LOG --> HIST["Streamlit Run History"]
+
+    classDef external fill:#f3f4f6,stroke:#6b7280,color:#111827;

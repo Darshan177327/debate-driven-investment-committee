@@ -1,0 +1,33 @@
+# Microsoft Agent Framework and Gemini
+agent-framework==1.26.0
+agent-framework-gemini==1.0.0b261112
+google-genai==3.3.0
+
+# Frontend
+streamlit==1.67.0
+
+# RAG and vector database
+chromadb==1.5.9
+fastembed==0.9.1
+
+# Document processing
+pymupdf==2.1
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+beautifulsoup4==4.15.0
+striprtf==0.0.35
+
+# Data processing and images
+pandas==3.1.1
+Pillow==13.0.0
+pytesseract==0.3.13
+
+# Configuration
+python-dotenv==1.2.4
+
+# Testing and demo notebook
+pytest==9.2.0
+notebook>=7,<8
+ipykernel>=6,<8
