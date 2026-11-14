@@ -86,3 +86,12 @@ The four automated tests validate controller decision logic; they are not three 
 ## 8. Academic Use
 
 This project demonstrates evidence retrieval, multi-agent debate, risk-based decision control, and execution logging. Its output is for academic demonstration only and is **not investment advice**.
+
+
+# Debate-Driven Investment Committee
+
+🚀 **Live Website:** [Open the Investment Committee Application](https://debate-driven-investment-committee.streamlit.app/)
+
+💻 **Source Code:** [GitHub Repository](https://github.com/Darshan177327/debate-driven-investment-committee)
+
+An AI-powered multi-agent investment analysis system using Microsoft Agent Framework, Google Gemini, RAG and Streamlit.
