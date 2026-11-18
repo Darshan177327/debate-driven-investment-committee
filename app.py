@@ -14,11 +14,12 @@ import streamlit as st
 
 from agents.committee_controller import run_committee
 from tools.multi_company_rag import (
-    index_document, list_indexed_companies, get_company_document_count
+    index_document, list_indexed_companies, get_company_document_count,
+    get_all_company_chunks
 )
 from tools.research_tools import set_active_company
 from tools.universal_document_processor import extract_document
-from tools.financial_dashboard import extract_financial_metrics
+from tools.financial_dashboard import extract_financial_metrics_from_chunks
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -200,84 +201,324 @@ def render_companies():
 
 def render_documents():
     header("Document centre", "Upload annual reports, financial statements, presentations and common business documents for company-specific retrieval.")
-    left,right = st.columns([1.15,.85])
+    left, right = st.columns([1.15, .85])
+
     with left:
         st.markdown("### Add source material")
         with st.form("upload_form", clear_on_submit=True):
             company = st.text_input("Company / entity name", placeholder="e.g. Reliance Industries Limited")
             files = st.file_uploader("Choose documents", type=SUPPORTED_EXTENSIONS, accept_multiple_files=True)
             submitted = st.form_submit_button("Upload and index documents", type="primary", use_container_width=True)
+
         if submitted:
             if not company.strip():
                 st.error("Enter a company name.")
             elif not files:
                 st.error("Choose at least one document.")
             else:
-                progress = st.progress(0)
                 successes, failures = [], []
-                for i, uploaded in enumerate(files):
-                    try:
-                        if uploaded.size > MAX_UPLOAD_MB*1024*1024:
-                            raise ValueError(f"File exceeds {MAX_UPLOAD_MB} MB.")
-                        path = safe_upload(company.strip(), uploaded)
-                        result = index_document(company.strip(), str(path))
-                        successes.append((uploaded.name, result))
-                    except Exception as exc:
-                        failures.append(f"{uploaded.name}: {exc}")
-                    progress.progress((i+1)/len(files))
-                for filename,result in successes:
-                    st.success(f"{filename}: {result.get('status','Indexed')} · {result.get('chunks_indexed',0)} new chunks")
+                overall = st.progress(0, text="Preparing upload queue")
+                overall_caption = st.empty()
+
+                for file_number, uploaded in enumerate(files, start=1):
+                    file_label = f"File {file_number}/{len(files)} · {uploaded.name}"
+                    with st.status(file_label, expanded=True) as status:
+                        st.markdown("#### Document processing")
+                        file_info = st.empty()
+                        file_info.caption(f"Preparing {uploaded.name} · {uploaded.size / 1024:,.1f} KB")
+
+                        # A single live processing panel: the same panel updates
+                        # as the real indexing pipeline reports each stage.
+                        stage_panel = st.empty()
+                        metric_panel = st.empty()
+                        progress_panel = st.empty()
+                        activity_panel = st.empty()
+
+                        stage_order = ["extract", "chunk", "embedding", "storage", "verify"]
+                        stage_names = {
+                            "extract": "Extract document text",
+                            "chunk": "Create searchable chunks",
+                            "embedding": "Generate semantic embeddings",
+                            "storage": "Store vectors in ChromaDB",
+                            "verify": "Verify indexed document",
+                        }
+                        stage_state = {name: "Waiting" for name in stage_order}
+                        activity = []
+                        stats = {"chunks": 0, "embedded": 0, "stored": 0}
+                        active_stage = "extract"
+
+                        def render_live_panel(message=None, phase_fraction=None):
+                            rows = []
+                            for key in stage_order:
+                                state = stage_state[key]
+                                if state == "Done":
+                                    marker = "🟢"
+                                elif state == "Active":
+                                    marker = "🟩"
+                                else:
+                                    marker = "⚪"
+                                rows.append(f"{marker} **{stage_names[key]}** · {state}")
+                            stage_panel.markdown("\n\n".join(rows))
+
+                            c1, c2, c3 = metric_panel.columns(3)
+                            c1.metric("Total chunks", f"{stats['chunks']:,}")
+                            c2.metric("Embeddings generated", f"{stats['embedded']:,}")
+                            c3.metric("Chunks stored", f"{stats['stored']:,}")
+
+                            if phase_fraction is not None:
+                                fraction = max(0.0, min(1.0, float(phase_fraction)))
+                                progress_panel.progress(
+                                    fraction,
+                                    text=f"{stage_names[active_stage]} · {int(fraction * 100)}% of this stage",
+                                )
+                            elif stage_state["verify"] == "Done":
+                                progress_panel.progress(1.0, text="All processing stages completed")
+                            else:
+                                progress_panel.empty()
+
+                            if message:
+                                activity.insert(0, message)
+                                activity[:] = activity[:4]
+                            if activity:
+                                activity_panel.caption("Recent activity  ·  " + "  |  ".join(activity))
+
+                        def show_index_progress(event):
+                            nonlocal active_stage
+                            stage = event["stage"]
+                            message = event.get("message", stage)
+                            if stage in ("extract", "extract_done"):
+                                active_stage = "extract"
+                                stage_state["extract"] = "Active" if stage == "extract" else "Done"
+                            elif stage in ("chunk", "chunk_done"):
+                                active_stage = "chunk"
+                                stage_state["extract"] = "Done"
+                                stage_state["chunk"] = "Active" if stage == "chunk" else "Done"
+                                if event.get("total") is not None:
+                                    stats["chunks"] = int(event["total"])
+                            elif stage in ("embedding", "embedding_done"):
+                                active_stage = "embedding"
+                                stage_state["extract"] = "Done"
+                                stage_state["chunk"] = "Done"
+                                stage_state["embedding"] = "Active"
+                                if event.get("completed") is not None:
+                                    stats["embedded"] = int(event["completed"])
+                            elif stage in ("storage", "storage_done"):
+                                active_stage = "storage"
+                                stage_state["extract"] = "Done"
+                                stage_state["chunk"] = "Done"
+                                stage_state["embedding"] = "Done"
+                                stage_state["storage"] = "Active"
+                                if event.get("completed") is not None:
+                                    stats["stored"] = int(event["completed"])
+                            elif stage == "complete":
+                                active_stage = "verify"
+                                for key in ("extract", "chunk", "embedding", "storage", "verify"):
+                                    stage_state[key] = "Done"
+                                if event.get("completed") is not None:
+                                    stats["stored"] = int(event["completed"])
+                            elif stage == "duplicate":
+                                for key in ("extract", "chunk", "embedding", "storage"):
+                                    stage_state[key] = "Done" if key in ("extract", "chunk") else "Waiting"
+                                message = "This exact document was already indexed; no duplicate chunks were added."
+
+                            fraction = None
+                            if active_stage == "embedding" and event.get("total"):
+                                fraction = stats["embedded"] / max(1, int(event["total"]))
+                            elif active_stage == "storage" and event.get("total"):
+                                fraction = stats["stored"] / max(1, int(event["total"]))
+                            render_live_panel(message, fraction)
+
+                        try:
+                            if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+                                raise ValueError(f"File exceeds {MAX_UPLOAD_MB} MB.")
+                            path = safe_upload(company.strip(), uploaded)
+                            result = index_document(
+                                company.strip(),
+                                str(path),
+                                progress_callback=show_index_progress,
+                            )
+                            if result.get("status") == "Already indexed":
+                                stage_panel.info("This document was already indexed. Existing chunks were preserved.")
+                            else:
+                                stage_state["verify"] = "Done"
+                                render_live_panel("Indexing finished successfully.")
+                            successes.append((uploaded.name, result))
+                            status.update(label=f"{file_label} · {result.get('status', 'Finished')}", state="complete")
+                        except Exception as exc:
+                            failures.append(f"{uploaded.name}: {exc}")
+                            activity_panel.error(f"Processing stopped: {exc}")
+                            status.update(label=f"{file_label} · Failed", state="error")
+
+                    overall.progress(file_number / len(files), text=f"Completed {file_number} of {len(files)} files")
+                    overall_caption.caption(f"Files completed: {file_number}/{len(files)}")
+
+                for filename, result in successes:
+                    st.success(f"{filename}: {result.get('status', 'Indexed')} · {result.get('chunks_indexed', 0):,} new chunks")
                 for failure in failures:
                     st.error(failure)
                 if successes:
                     st.rerun()
+
         st.caption("Formats supported by the current processor: PDF, DOCX, XLSX, XLS, CSV, PPTX, TXT, MD, RTF, HTML, JSON, XML and common image formats. OCR on scanned files requires a working Tesseract installation.")
+
     with right:
         st.markdown("### How indexing works")
-        st.markdown('<div class="panel">**1 · Extract** — text and tables are read from the uploaded file.  \n**2 · Split** — content is divided into overlapping evidence chunks.  \n**3 · Embed locally** — FastEmbed creates 384-dimensional vectors.  \n**4 · Store** — ChromaDB keeps a separate collection for each company.  \n**5 · Retrieve** — agents search only the selected company collection.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel">**1 · Extract** — read text and tables.  \n**2 · Chunk** — split into overlapping evidence passages.  \n**3 · Embed** — generate local FastEmbed vectors in batches.  \n**4 · Store** — write each batch to the company ChromaDB collection.  \n**5 · Retrieve** — agents search the selected company collection.</div>', unsafe_allow_html=True)
         st.markdown("### Existing companies")
         for name in companies():
             st.write(f"**{name}** · {get_company_document_count(name):,} chunks")
 
 def render_financials():
-    header("Financial dashboard", "Charts are generated only from financial figures that can be extracted from the company's uploaded source documents.")
+    header(
+        "Financial dashboard",
+        "Financial charts generated from figures extracted from the company’s indexed annual reports. Each metric is charted separately to avoid mixing unlike values."
+    )
     comps = companies()
     if not comps:
-        st.info("Upload and index a financial document first.")
+        st.info("Upload and index a company document first.")
         return
+
     company = st.selectbox("Company", comps, key="financial_company")
-    docs = company_documents(company)
-    if not docs:
-        st.warning("No original files are available in the uploads folder for this company. The vector index remains available for agent retrieval, but this chart parser needs the source file.")
-        return
-    selected_docs = st.multiselect("Source documents", [p.name for p in docs], default=[p.name for p in docs])
-    metrics = []
-    errors = []
-    for path in docs:
-        if path.name not in selected_docs:
-            continue
+    total_chunks = get_company_document_count(company)
+    st.caption(f"{total_chunks:,} indexed chunks · source: existing company collection")
+
+    with st.spinner(f"Reading indexed evidence for {company}..."):
         try:
-            extracted = extract_document(str(path))
-            metrics.extend(extract_financial_metrics(extracted["full_text"], path.name))
+            chunks = get_all_company_chunks(company)
+            metrics = extract_financial_metrics_from_chunks(chunks)
         except Exception as exc:
-            errors.append(f"{path.name}: {exc}")
-    if errors:
-        for error in errors: st.warning(error)
+            st.error(f"Could not read financial evidence from this company’s index: {exc}")
+            return
+
     if not metrics:
-        st.info("No comparable two-period financial statement rows were confidently recognised in the selected files. No chart has been fabricated. Try an annual report PDF or a structured XLSX/CSV statement.")
+        st.warning(
+            "This company is indexed, but no financial figures could be confidently paired with reporting periods. "
+            "The source documents remain available to the research agents; no charts have been fabricated."
+        )
+        with st.expander("Inspect indexed documents"):
+            source_rows = {}
+            for item in chunks:
+                meta = item.get("metadata") or {}
+                name = meta.get("filename", "Unknown document")
+                source_rows[name] = source_rows.get(name, 0) + 1
+            if source_rows:
+                st.dataframe(
+                    pd.DataFrame([{"Document": name, "Indexed chunks": count} for name, count in sorted(source_rows.items())]),
+                    use_container_width=True, hide_index=True
+                )
         return
-    frame = pd.DataFrame(metrics)
-    frame = frame.drop_duplicates(subset=["metric","period","value","source"])
-    st.caption("Extracted values are in the units printed in the source. Check each source before relying on a chart; this is an automated first-pass parser.")
-    metric_names = sorted(frame["metric"].unique())
-    chosen = st.selectbox("Financial metric", metric_names)
-    subset = frame[frame["metric"] == chosen]
-    pivot = subset.pivot_table(index="period", columns="source", values="value", aggfunc="first")
-    st.markdown(f"### {chosen}")
-    st.bar_chart(pivot, use_container_width=True)
-    st.dataframe(subset.sort_values(["source","period"]), use_container_width=True, hide_index=True)
-    st.download_button("Download extracted figures (CSV)", subset.to_csv(index=False), file_name=f"{slug(company)}_extracted_financials.csv", mime="text/csv")
-    st.warning("Automated extraction can misread table layouts, units, or standalone versus consolidated statements. Verify the displayed values against the cited source document.")
+
+    frame = pd.DataFrame(metrics).copy()
+    for col, default in [("scope", "Unspecified"), ("currency", "Unspecified"), ("unit", "Unspecified"), ("source", "Indexed document"), ("chunk", None), ("evidence", "")]:
+        if col not in frame.columns:
+            frame[col] = default
+    frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+    frame = frame.dropna(subset=["metric", "period", "value"])
+    frame = frame.drop_duplicates(subset=["metric", "period", "value", "source", "chunk", "scope", "currency", "unit"])
+    if frame.empty:
+        st.info("The extractor returned no usable numeric metric-period pairs.")
+        return
+
+    def period_key(value):
+        nums = re.findall(r"\d+", str(value))
+        return (int(nums[0]) if nums else 0, int(nums[1]) if len(nums) > 1 else 0, str(value))
+
+    frame["_period_order"] = frame["period"].map(period_key)
+    frame = frame.sort_values("_period_order")
+
+    # Filters deliberately keep unlike reporting bases and units apart.
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        scope_options = sorted(frame["scope"].fillna("Unspecified").astype(str).unique())
+        selected_scope = st.selectbox("Reporting basis", scope_options, key="financial_scope")
+    with f2:
+        currency_options = sorted(frame["currency"].fillna("Unspecified").astype(str).unique())
+        selected_currency = st.selectbox("Currency", currency_options, key="financial_currency")
+    with f3:
+        unit_options = sorted(frame["unit"].fillna("Unspecified").astype(str).unique())
+        selected_unit = st.selectbox("Unit", unit_options, key="financial_unit")
+    with f4:
+        chart_type = st.selectbox("Chart style", ["Bar chart", "Line chart"], key="financial_chart_type")
+
+    filtered = frame[
+        (frame["scope"].fillna("Unspecified").astype(str) == selected_scope) &
+        (frame["currency"].fillna("Unspecified").astype(str) == selected_currency) &
+        (frame["unit"].fillna("Unspecified").astype(str) == selected_unit)
+    ].copy()
+    if filtered.empty:
+        st.info("No figures match these reporting-basis and unit filters.")
+        return
+
+    # A metric is always charted against its own reporting periods. Source files
+    # remain separate series so duplicate/conflicting reports are visible.
+    categories = {
+        "Revenue & income": ["revenue", "income", "turnover", "fees", "dividend", "interest"],
+        "Profitability": ["profit", "ebitda", "earnings per share", "finance costs", "expenses", "depreciation"],
+        "Balance sheet": ["assets", "equity", "liabilities", "borrowings", "cash and cash"],
+        "Cash flow": ["cash flow", "operating cash", "investing cash", "financing cash"],
+    }
+    def category_for(metric):
+        low = str(metric).casefold()
+        for category, terms in categories.items():
+            if any(term in low for term in terms):
+                return category
+        return "Other metrics"
+
+    filtered["category"] = filtered["metric"].map(category_for)
+    periods = sorted(filtered["period"].unique(), key=period_key)
+    st.markdown("### Financial performance overview")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Extracted figures", f"{len(filtered):,}")
+    k2.metric("Financial metrics", f"{filtered['metric'].nunique():,}")
+    k3.metric("Reporting periods", f"{len(periods):,}")
+    st.caption(f"Showing {selected_scope} · {selected_currency} · {selected_unit}. Figures from different bases or units are intentionally not combined.")
+
+    category_names = [name for name in ["Revenue & income", "Profitability", "Balance sheet", "Cash flow", "Other metrics"] if name in set(filtered["category"])]
+    tabs = st.tabs(category_names)
+    for tab, category in zip(tabs, category_names):
+        with tab:
+            category_frame = filtered[filtered["category"] == category]
+            metric_names = sorted(category_frame["metric"].unique(), key=str.casefold)
+            for offset in range(0, len(metric_names), 2):
+                cols = st.columns(2)
+                for col, metric_name in zip(cols, metric_names[offset:offset + 2]):
+                    with col:
+                        metric_frame = category_frame[category_frame["metric"] == metric_name].copy()
+                        # Use source as separate series; never add different companies/documents together.
+                        chart_frame = metric_frame.pivot_table(
+                            index="period", columns="source", values="value", aggfunc="first"
+                        )
+                        chart_frame = chart_frame.reindex(sorted(chart_frame.index, key=period_key))
+                        st.markdown(f"**{metric_name}**")
+                        if len(chart_frame.index) >= 2:
+                            if chart_type == "Bar chart":
+                                st.bar_chart(chart_frame, use_container_width=True)
+                            else:
+                                st.line_chart(chart_frame, use_container_width=True)
+                        elif len(chart_frame.index) == 1:
+                            st.metric(str(chart_frame.index[0]), f"{chart_frame.iloc[0, 0]:,.2f}")
+                            st.caption("Only one reporting period was confidently extracted; a trend chart needs at least two periods.")
+                        else:
+                            st.info("No chartable periods for this metric.")
+                        with st.expander(f"Evidence · {metric_name}"):
+                            evidence_cols = [c for c in ["period", "value", "source", "chunk", "evidence"] if c in metric_frame.columns]
+                            st.dataframe(metric_frame[evidence_cols], use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Download extracted figures (CSV)",
+        filtered.drop(columns=["_period_order", "category"], errors="ignore").to_csv(index=False),
+        file_name=f"{slug(company)}_financial_metrics.csv",
+        mime="text/csv",
+    )
+    with st.expander("Extraction coverage and source documents"):
+        coverage = filtered.groupby("source").agg(
+            Metrics=("metric", "nunique"),
+            Values=("value", "count"),
+            Periods=("period", "nunique"),
+            Chunks=("chunk", "nunique"),
+        ).reset_index().rename(columns={"source": "Document"})
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+        st.caption("Charts are generated from extracted report figures, not chart images copied from PDFs. Open each Evidence panel to verify the original text and chunk reference.")
 
 def render_committee():
     header("Committee room", "Run the Research → Bull → Bear → Rebuttal → Judge workflow, followed by the Risk Agent veto check.")

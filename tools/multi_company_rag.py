@@ -240,113 +240,105 @@ def create_query_embedding(query: str) -> list[float]:
 
 def index_document(
     company_name: str,
-    file_path: str
+    file_path: str,
+    progress_callback=None,
 ) -> dict:
-    """Extract, chunk and index a document locally."""
+    """Extract, chunk, embed and index a document.
+
+    progress_callback receives truthful stage events. Existing callers remain
+    compatible because the callback is optional.
+    """
+
+    def report(stage: str, message: str, *, completed=None, total=None):
+        if progress_callback is not None:
+            progress_callback({
+                "stage": stage,
+                "message": message,
+                "completed": completed,
+                "total": total,
+            })
 
     path = Path(file_path)
-
     if not path.exists() or not path.is_file():
-        raise FileNotFoundError(
-            f"Document not found: {path}"
-        )
+        raise FileNotFoundError(f"Document not found: {path}")
 
     print("\n[INDEXING] Document:", path.name)
-
+    report("extract", "Extracting text and tables from the document")
     document = extract_document(str(path))
-
     full_text = document.get("full_text", "")
-
     if not full_text or not full_text.strip():
-        raise ValueError(
-            f"No readable text found in {path.name}"
-        )
+        raise ValueError(f"No readable text found in {path.name}")
+    report("extract_done", f"Extraction complete · {len(full_text):,} characters")
 
+    report("chunk", "Splitting extracted text into overlapping chunks")
     chunks = split_text(full_text)
-
     if not chunks:
         raise ValueError("No chunks generated.")
+    report("chunk_done", f"Chunking complete · {len(chunks):,} chunks created", completed=len(chunks), total=len(chunks))
 
     collection = get_company_collection(company_name)
-
-    file_hash = hashlib.sha256(
-        path.read_bytes()
-    ).hexdigest()
-
-    # Skip exact duplicate document content.
-    existing = collection.get(
-        where={"document_hash": file_hash},
-        include=["metadatas"]
-    )
-
+    file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    existing = collection.get(where={"document_hash": file_hash}, include=["metadatas"])
     if existing["ids"]:
         print("[SKIPPED] This document is already indexed.")
-
+        report("duplicate", "This exact document is already indexed; no duplicate chunks were added")
         return {
             "company": company_name,
             "filename": path.name,
             "chunks_indexed": 0,
             "status": "Already indexed",
-            "collection": collection.name
+            "collection": collection.name,
         }
 
     ids = []
     metadatas = []
-
     for index, chunk in enumerate(chunks):
-
-        chunk_id = hashlib.sha256(
-            f"{file_hash}_{index}".encode("utf-8")
-        ).hexdigest()
-
+        chunk_id = hashlib.sha256(f"{file_hash}_{index}".encode("utf-8")).hexdigest()
         ids.append(chunk_id)
-
         metadatas.append({
             "company": company_name.strip(),
             "filename": path.name,
             "file_type": path.suffix.lower(),
             "document_hash": file_hash,
             "chunk_index": index,
-            "total_chunks": len(chunks)
+            "total_chunks": len(chunks),
         })
 
-    print("[INDEXING] Total chunks:", len(chunks))
-    print("[INDEXING] Generating local embeddings...")
-
-    for start in range(0, len(chunks), BATCH_SIZE):
-
+    total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+    embedded_count = 0
+    stored_count = 0
+    for batch_number, start in enumerate(range(0, len(chunks), BATCH_SIZE), start=1):
         end = min(start + BATCH_SIZE, len(chunks))
-
         batch_texts = chunks[start:end]
 
-        batch_embeddings = create_document_embeddings(
-            batch_texts
-        )
+        report("embedding", f"Generating embeddings · batch {batch_number}/{total_batches}", completed=embedded_count, total=len(chunks))
+        batch_embeddings = create_document_embeddings(batch_texts)
+        embedded_count += len(batch_embeddings)
+        report("embedding_done", f"Embeddings generated · {embedded_count:,}/{len(chunks):,} chunks", completed=embedded_count, total=len(chunks))
 
+        report("storage", f"Writing batch {batch_number}/{total_batches} to ChromaDB", completed=stored_count, total=len(chunks))
         collection.add(
             ids=ids[start:end],
             documents=batch_texts,
             embeddings=batch_embeddings,
-            metadatas=metadatas[start:end]
+            metadatas=metadatas[start:end],
         )
-
-        print(
-            f"[INDEXING] {end}/{len(chunks)} chunks stored"
-        )
+        stored_count += len(batch_texts)
+        report("storage_done", f"Stored in ChromaDB · {stored_count:,}/{len(chunks):,} chunks", completed=stored_count, total=len(chunks))
+        print(f"[INDEXING] {stored_count}/{len(chunks)} chunks stored")
 
     result = {
         "company": company_name,
         "filename": path.name,
-        "chunks_indexed": len(chunks),
+        "chunks_indexed": stored_count,
         "characters": len(full_text),
         "collection": collection.name,
         "embedding_model": MODEL_NAME,
         "embedding_dimension": EMBEDDING_DIMENSION,
-        "status": "Successfully indexed"
+        "status": "Successfully indexed",
     }
-
+    report("complete", f"Indexing complete · {stored_count:,} chunks stored", completed=stored_count, total=len(chunks))
     print("\n[SUCCESS] Document indexing completed.")
-
     return result
 
 
@@ -398,6 +390,31 @@ def search_company_documents(
         })
 
     return matches
+
+
+def get_all_company_chunks(company_name: str, batch_size: int = 500) -> list[dict]:
+    """Read all indexed chunks for one company without changing ChromaDB."""
+    collection = get_company_collection(company_name)
+    total = collection.count()
+    if total <= 0:
+        return []
+    output = []
+    for offset in range(0, total, batch_size):
+        result = collection.get(
+            limit=min(batch_size, total - offset),
+            offset=offset,
+            include=["documents", "metadatas"],
+        )
+        documents = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        for text, metadata in zip(documents, metadatas):
+            output.append({"text": text or "", "metadata": metadata or {}})
+    # Stable ordering helps adjacent chunk context and repeatable results.
+    output.sort(key=lambda item: (
+        str((item.get("metadata") or {}).get("filename", "")),
+        int((item.get("metadata") or {}).get("chunk_index", 0)),
+    ))
+    return output
 
 
 # ==================================================
